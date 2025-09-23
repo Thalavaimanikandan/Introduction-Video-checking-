@@ -1,43 +1,35 @@
-from transformers import pipeline
 import cv2
 import os
 
-def is_intro_caption(caption_text):
-   
-    keywords = ["intro video", "introduction", "opening video"]
-    caption_text = caption_text.lower()
-    return any(keyword in caption_text for keyword in keywords)
+def check_intro_video(video_path, caption_text="", max_duration=30, debug=False):
+    text_to_check = (caption_text + " " + os.path.basename(video_path)).lower()
+    caption_claim = any(word in text_to_check for word in ["intro", "introduction", "opening"])
+    if debug:
+        print(f"[DEBUG] Text Checked: '{text_to_check}' -> Caption Claim = {caption_claim}")
 
-def analyze_video(video_path):
-    
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return "Error: Cannot open video file ❌"
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
     duration = frame_count / fps
-
-    
-    if duration > 30:  
-        cap.release()
-        return False
     cap.release()
-   
-    return True
 
-def check_intro_video(video_path, caption_text):
-    caption_claim = is_intro_caption(caption_text)
-    video_valid = analyze_video(video_path)
+    if debug:
+        print(f"[DEBUG] Video Duration = {duration:.2f}s (Max allowed = {max_duration}s)")
 
-    if caption_claim and video_valid:
-        return "Real Intro Video ✅"
-    elif caption_claim and not video_valid:
-        return "Fake Intro Video ⚠️"
+    if caption_claim and duration <= max_duration:
+        result = "Real Intro Video ✅"
+    elif caption_claim:
+        result = "Fake Intro Video ⚠️"
     else:
-        return "Not an Intro Video ❌"
+        result = "Not an Intro Video ❌"
 
+    if debug:
+        print(f"[DEBUG] Final Result -> {result}")
+    return result
 
+print(check_intro_video("Asked AI to make Mr Beast more Handsome and slightly cartoonish.mp4", debug=True))
+print(check_intro_video("How To Introduce Yourself_  Upsc interview #introduction.mp4", debug=True))
+print(check_intro_video("Integrating Python with OpenAI Chatgpt {தமிழ்} (1).mp4", "Self Intro Video", debug=True))
 
-video_path = "How To Introduce Yourself_  Upsc interview #introduction.mp4"
-caption_text = "My awesome intro video"
-
-result = check_intro_video(video_path, caption_text)
-print(result)
