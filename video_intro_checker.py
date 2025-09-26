@@ -1,35 +1,195 @@
-import cv2
 import os
+import shutil
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple, Dict, Any
 
-def check_intro_video(video_path, caption_text="", max_duration=30, debug=False):
-    text_to_check = (caption_text + " " + os.path.basename(video_path)).lower()
-    caption_claim = any(word in text_to_check for word in ["intro", "introduction", "opening"])
-    if debug:
-        print(f"[DEBUG] Text Checked: '{text_to_check}' -> Caption Claim = {caption_claim}")
+import cv2
+import numpy as np
+import dlib
+import imageio
 
-    cap = cv2.VideoCapture(video_path)
+try:
+    import whisper
+except ImportError:
+    raise ImportError("Install openai-whisper: pip install -U openai-whisper")
+
+try:
+    import face_recognition
+except ImportError:
+    raise ImportError("Install dlib & face_recognition: pip install face_recognition")
+MAX_SIZE_MB = 200
+MIN_DURATION = 5
+MAX_DURATION = 120
+
+MAX_SAMPLED_FRAMES = 30
+DOWNSAMPLE_WIDTH = 320
+FACE_TOLERANCE = 0.6
+TRANSCRIBE_SECONDS = 35
+WHISPER_MODEL = "base"
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
+
+INTRO_KEYWORDS = [
+    "my name", "i am", "introduce", "i belong",
+    "i completed", "i studied", "i graduated",
+    "currently i am", "i have done"
+]
+
+CAPTION_KEYWORDS = ["intro", "myself", "self-introduction"]
+
+detector = dlib.get_frontal_face_detector()
+sp = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+facerec = dlib.face_recognition_model_v1("dlib_face_recognition_resnet_model_v1.dat")
+
+def run_ffmpeg_extract_segment(input_path: str, out_path: str, seconds: int) -> None:
+    cmd = [
+        FFMPEG_BIN, "-y", "-i", input_path,
+        "-t", str(seconds), "-vn",
+        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", out_path
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode(errors='ignore')}")
+
+
+def get_video_properties(file_path: str) -> Tuple[int, float, float]:
+    cap = cv2.VideoCapture(file_path)
     if not cap.isOpened():
-        return "Error: Cannot open video file ❌"
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    duration = frame_count / fps
+        raise IOError("Cannot open video file.")
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    duration = frames / fps if fps else 0.0
     cap.release()
+    return frames, fps, duration
 
-    if debug:
-        print(f"[DEBUG] Video Duration = {duration:.2f}s (Max allowed = {max_duration}s)")
 
-    if caption_claim and duration <= max_duration:
-        result = "Real Intro Video ✅"
-    elif caption_claim:
-        result = "Fake Intro Video ⚠️"
+def transcribe_first_n_seconds(file_path: str, n_seconds: int, model_name: str = WHISPER_MODEL) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = os.path.join(tmp, "segment.wav")
+        run_ffmpeg_extract_segment(file_path, audio_path, n_seconds)
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = whisper.load_model(model_name, device=device)
+        result = model.transcribe(audio_path, fp16=(device == "cuda"))
+        return (result.get("text", "") or "").strip().lower()
+
+
+def check_intro_video(file_path: str, caption: str = "") -> Tuple[bool, str]:
+    caption_lower = (caption or "").lower()
+    transcript = transcribe_first_n_seconds(file_path, TRANSCRIBE_SECONDS)
+    first_words = " ".join(transcript.split()[:50])
+    found_intro = any(k in first_words for k in INTRO_KEYWORDS)
+    caption_intro = any(k in caption_lower for k in CAPTION_KEYWORDS)
+    if caption_intro and not found_intro:
+        return False, "Caption says intro but video transcript missing keywords"
+    if found_intro:
+        return True, "Intro video detected"
+    return False, "No intro keywords in first ~50 words"
+
+def encode_faces(frame_bgr: np.ndarray, num_jitters: int = 1) -> list[np.ndarray]:
+    """Detect faces in a frame and return 128-d embeddings."""
+    if frame_bgr is None:
+        return []
+    img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    detections = detector(img, 1)
+    if len(detections) == 0:
+        return []
+    encodings = []
+    for det in detections:
+        try:
+            shape = sp(img, det)
+            face_descriptor = facerec.compute_face_descriptor(img, shape, num_jitters)
+            encodings.append(np.array(face_descriptor))
+        except Exception as e:
+            print(f"Face encoding error: {e}")
+            continue
+    return encodings
+
+
+def sample_frame_indices(total_frames: int, max_samples: int) -> List[int]:
+    if total_frames <= max_samples:
+        return list(range(total_frames))
+    step = total_frames / float(max_samples)
+    return [int(i * step) for i in range(max_samples)]
+
+
+def check_real_or_ai(file_path: str, caption: str = "") -> Tuple[bool, str]:
+    try:
+        reader = imageio.get_reader(file_path, format="ffmpeg")
+    except Exception as e:
+        return False, f"Cannot open video: {e}"
+
+    nframes = reader.count_frames()
+    if nframes == 0:
+        reader.close()
+        return False, "Video has no frames"
+
+    indices = sample_frame_indices(nframes, MAX_SAMPLED_FRAMES)
+
+    embeddings = []
+    for idx in indices:
+        try:
+            frame = reader.get_data(idx)
+            encs = encode_faces(frame)
+            if encs:
+                embeddings.append(encs[0])
+        except Exception:
+            continue
+
+    reader.close()
+
+    if not embeddings:
+        return False, "No face detected in sampled frames"
+
+    mean_emb = np.mean(np.stack(embeddings), axis=0)
+    consistent_count = sum(np.linalg.norm(mean_emb - emb) <= FACE_TOLERANCE for emb in embeddings)
+    consistency_ratio = consistent_count / len(embeddings)
+
+    if consistency_ratio >= 0.8:  
+        return True, f"Face consistent ({consistent_count}/{len(embeddings)} frames matched)"
     else:
-        result = "Not an Intro Video ❌"
+        return False, f"Face inconsistent ({consistent_count}/{len(embeddings)} frames matched)"
 
-    if debug:
-        print(f"[DEBUG] Final Result -> {result}")
-    return result
+def check_video_info(file_path: str) -> Tuple[bool, str]:
+    if not os.path.exists(file_path):
+        return False, "File not found"
+    size_mb = os.path.getsize(file_path) / (1024*1024)
+    if size_mb > MAX_SIZE_MB:
+        return False, f"Video too large: {size_mb:.2f} MB"
+    _, _, duration = get_video_properties(file_path)
+    if duration < MIN_DURATION:
+        return False, f"Video too short: {duration:.2f}s"
+    if duration > MAX_DURATION:
+        return False, f"Video too long: {duration:.2f}s"
+    return True, f"Video ok: {duration:.2f}s, {size_mb:.2f}MB"
 
-print(check_intro_video("Asked AI to make Mr Beast more Handsome and slightly cartoonish.mp4", debug=True))
-print(check_intro_video("How To Introduce Yourself_  Upsc interview #introduction.mp4", debug=True))
-print(check_intro_video("Integrating Python with OpenAI Chatgpt {தமிழ்} (1).mp4", "Self Intro Video", debug=True))
+def main_pipeline(file_path: str, caption: str = "") -> Dict[str, Any]:
+    logs = []
+    for func, name in [(check_intro_video, "Intro Check"),
+                       (check_real_or_ai, "Face Consistency"),
+                       (check_video_info, "Video Info")]:
+        try:
+            ok, msg = func(file_path, caption) if func != check_video_info else func(file_path)
+        except Exception as e:
+            ok, msg = False, f"{name} failed: {e}"
+        logs.append((name, ok, msg))
+        if not ok:
+            return {"verdict": "❌", "message": msg, "logs": logs}
+    return {"verdict": "✅", "message": "Video Accepted", "logs": logs}
 
+
+def print_result(res: Dict[str, Any]):
+    print("\n=== FINAL VERDICT ===")
+    print(res.get("verdict", "?"), res.get("message", ""))
+    print("\n=== DETAILS ===")
+    for step, ok, msg in res.get("logs", []):
+        print(f"{step}: {'✅' if ok else '❌'} - {msg}")
+
+
+if __name__ == "__main__":
+    file_path = "ssvid.net--How-to-Introduce-Yourself-in-English-Self-introduction-for_360p.mp4"
+    caption = "My intro video"
+
+    result = main_pipeline(file_path, caption)
+    print_result(result)
