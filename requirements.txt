@@ -1,0 +1,13 @@
+opencv-python
+
+numpy
+
+torch
+
+dlib
+
+imageio
+
+openai-whisper
+
+python-dotenv
